@@ -1,0 +1,10 @@
+
+
+!execute	Admins + Mods	Starts 30s vote to mute for 1 week
+!promote	Owner	        Gives Moderator role
+!demote	        Owner	        Removes Moderator role
+!lockdown	Owner	        Locks channels for set duration
+!unlock	        Owner	        Ends lockdown early
+!forgive	Owner	        Instantly unbans/unmutes
+Apology Vote	Automatic	1‑hour forgiveness vote requiring 50% human approval
+Owner‑Protection	Automatic	Escalating punishments for targeting gives them muted for 3 hours

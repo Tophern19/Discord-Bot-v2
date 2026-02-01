@@ -1,0 +1,853 @@
+// bot.js
+
+const fs = require("fs");
+const path = require("path");
+const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
+
+// === Configuration ===
+const OWNER_IDS = ["OWNER ID HERE"];
+const MOD_ROLE_NAMES = ["MOD", "Mod", "MODERATOR", "Moderator", "Admin", "GOD", "Owner", "admin"];
+const MOD_ROLE_ID = null; // optional: set to numeric role ID here if you want
+
+// === Logging paths ===
+const LOG_DIR = path.join(__dirname, "logs");
+const EXECUTION_LOG_FILE = path.join(LOG_DIR, "Execution-logs.txt");
+const PROMOTION_LOG_FILE = path.join(LOG_DIR, "Promotion-logs.txt");
+const DEMOTION_LOG_FILE = path.join(LOG_DIR, "Demotion-logs.txt");
+const LOCKDOWN_LOG_FILE = path.join(LOG_DIR, "Lockdown-logs.txt");
+const PUNISH_DATA_FILE = path.join(LOG_DIR, "punishdata.json");
+
+// Ensure log folder and files exist
+function ensureLogEnvironment() {
+  if (!fs.existsSync(LOG_DIR)) {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+  }
+
+  const files = [
+    EXECUTION_LOG_FILE,
+    PROMOTION_LOG_FILE,
+    DEMOTION_LOG_FILE,
+    LOCKDOWN_LOG_FILE,
+    PUNISH_DATA_FILE
+  ];
+
+  for (const file of files) {
+    if (!fs.existsSync(file)) {
+      if (file.endsWith(".json")) {
+        fs.writeFileSync(file, "{}");
+      } else {
+        fs.writeFileSync(file, "");
+      }
+    }
+  }
+}
+
+// Append to a text log
+function appendTextLog(filePath, text) {
+  ensureLogEnvironment();
+  const line = `[${new Date().toLocaleString()}] ${text}\n`;
+  fs.appendFileSync(filePath, line);
+}
+
+// Load punish data
+function loadPunishData() {
+  ensureLogEnvironment();
+  try {
+    const raw = fs.readFileSync(PUNISH_DATA_FILE, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
+
+// Save punish data
+function savePunishData(data) {
+  ensureLogEnvironment();
+  fs.writeFileSync(PUNISH_DATA_FILE, JSON.stringify(data, null, 2));
+}
+
+// === Client ===
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers
+  ]
+});
+
+// ===== Helper: find moderator role =====
+function findModRole(guild) {
+  if (MOD_ROLE_ID) {
+    const byId = guild.roles.cache.get(MOD_ROLE_ID);
+    if (byId) return byId;
+  }
+
+  return guild.roles.cache.find(r => MOD_ROLE_NAMES.includes(r.name));
+}
+
+// ===== Helper: can bot manage role =====
+function canBotManageRole(guild, role) {
+  const botMember = guild.members.me || guild.members.cache.get(client.user.id);
+  if (!botMember) return false;
+  if (!botMember.permissions.has(PermissionsBitField.Flags.ManageRoles)) return false;
+  return botMember.roles.highest.position > role.position;
+}
+
+// ===== Lockdown storage =====
+const LOCKUPS = new Map(); // guildId -> { timeout, originalOverwrites }
+
+// ===== Forgiveness vote storage =====
+const FORGIVENESS_VOTES = new Map();
+
+// ===== Message handler (core commands) =====
+client.on("messageCreate", async (message) => {
+  if (message.author.bot) return;
+  if (!message.guild) return;
+
+  const content = message.content.trim();
+
+// ============================
+// RICKROLL QUIZ + LEADERBOARD
+// ============================
+if (content.startsWith("!rickroll")) {
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require("discord.js");
+  const channel = message.channel;
+  const guild = message.guild;
+  const everyone = guild.roles.everyone;
+
+  // Leaderboard file
+  const leaderboardPath = path.join(LOG_DIR, "rickroll_leaderboard.json");
+
+  function loadLeaderboard() {
+    ensureLogEnvironment();
+    try {
+      return JSON.parse(fs.readFileSync(leaderboardPath, "utf8"));
+    } catch {
+      return {};
+    }
+  }
+
+  function saveLeaderboard(data) {
+    ensureLogEnvironment();
+    fs.writeFileSync(leaderboardPath, JSON.stringify(data, null, 2));
+  }
+
+  function recordPass(id) {
+    const data = loadLeaderboard();
+    if (!data[id]) data[id] = { passes: 0, fails: 0 };
+    data[id].passes++;
+    saveLeaderboard(data);
+  }
+
+  function recordFail(id) {
+    const data = loadLeaderboard();
+    if (!data[id]) data[id] = { passes: 0, fails: 0 };
+    data[id].fails++;
+    saveLeaderboard(data);
+  }
+
+  // Permission check
+  if (
+    !OWNER_IDS.includes(message.author.id) &&
+    !message.member.roles.cache.some(r => MOD_ROLE_NAMES.includes(r.name))
+  ) {
+    return message.reply("Only the bot owner or a Moderator can use this command.");
+  }
+
+  // Send video
+  await channel.send("🎵 **You've been Rickrolled!** You must pass the quiz to speak again.");
+  await channel.send({ files: ["./Rick_Astley_Never_Gonna_Give_You_Up.mp4"] });
+
+  // Lock channel
+  await channel.permissionOverwrites.edit(everyone, {
+    SendMessages: false,
+    SendMessagesInThreads: false
+  }).catch(() => {});
+
+  // Wait for video duration
+  await new Promise(res => setTimeout(res, 213000));
+
+  // Quiz questions
+  const quiz = [
+    { q: "What color is Rick’s jacket in the opening alley scene?", a: "Tan / light brown", options: ["Black", "Blue", "Tan / light brown", "White"] },
+    { q: "What pattern is on Rick’s shirt during the outdoor scenes?", a: "Stripes", options: ["Solid color", "Stripes", "Checkered", "Polka dots"] },
+    { q: "What type of fence does Rick sing in front of?", a: "Chain-link", options: ["Wooden", "Brick wall", "Chain-link", "Metal bars"] },
+    { q: "What is the backup dancer wearing on his head?", a: "Nothing", options: ["A hat", "Sunglasses", "Nothing", "A bandana"] },
+    { q: "What does Rick do with his hands during the spin move?", a: "Points outward", options: ["Claps", "Snaps", "Waves", "Points outward"] },
+    { q: "What color is the floor in the long hallway scene?", a: "Light gray", options: ["Black", "White", "Dark brown", "Light gray"] },
+    { q: "What object does Rick lean on in the outdoor scenes?", a: "A lamppost", options: ["A railing", "A wall", "A bench", "A lamppost"] },
+    { q: "What color is the backup dancer’s shirt during his jump move?", a: "Blue", options: ["Red", "Yellow", "Green", "Blue"] },
+    { q: "What is behind Rick in the alleyway besides the brick wall?", a: "A pipe", options: ["A window", "A dumpster", "A pipe", "A door"] },
+    { q: "What does the camera do during the final chorus?", a: "Slowly circles around him", options: ["Zooms out", "Tilts upward", "Shakes slightly", "Slowly circles around him"] }
+  ];
+
+  await channel.send("📝 **Rickroll Quiz Starting!** Each user must pass individually to speak again.");
+
+  const activeUsers = new Set();
+
+  const startQuiz = async (user) => {
+    if (activeUsers.has(user.id)) return;
+    activeUsers.add(user.id);
+
+    let score = 0;
+    let index = 0;
+
+    const ask = async () => {
+      const q = quiz[index];
+
+      const row = new ActionRowBuilder().addComponents(
+        q.options.map(opt =>
+          new ButtonBuilder()
+            .setCustomId(opt)
+            .setLabel(opt)
+            .setStyle(ButtonStyle.Primary)
+        )
+      );
+
+      const msg = await channel.send({
+        content: `**Question ${index + 1}/10**\n${q.q}`,
+        components: [row]
+      });
+
+      const collector = msg.createMessageComponentCollector({ time: 30000 });
+
+      collector.on("collect", async interaction => {
+        if (interaction.user.id !== user.id) {
+          return interaction.reply({ content: "This is not your quiz.", ephemeral: true });
+        }
+
+        if (interaction.customId === q.a) {
+          score++;
+          await interaction.reply({ content: "✔️ Correct!", ephemeral: true });
+        } else {
+          await interaction.reply({ content: "❌ Wrong!", ephemeral: true });
+        }
+
+        collector.stop();
+      });
+
+      collector.on("end", async () => {
+        index++;
+        if (index < quiz.length) {
+          ask();
+        } else {
+          if (score >= 7) {
+            recordPass(user.id);
+
+            await channel.permissionOverwrites.edit(user.id, {
+              SendMessages: true,
+              SendMessagesInThreads: true
+            }).catch(() => {});
+
+            await channel.send(`🎉 <@${user.id}> passed with **${score}/10** and is now unlocked.`);
+          } else {
+            recordFail(user.id);
+
+            await channel.send(`❌ <@${user.id}> failed with **${score}/10**. Try again.`);
+            activeUsers.delete(user.id);
+          }
+        }
+      });
+    };
+
+    ask();
+  };
+
+  // Trigger quiz when user tries to talk
+  const filter = (m) => !m.author.bot;
+  const collector = channel.createMessageCollector({ filter });
+
+  collector.on("collect", async (m) => {
+    if (!m.member.permissionsIn(channel).has(PermissionsBitField.Flags.SendMessages)) {
+      startQuiz(m.author);
+      m.delete().catch(() => {});
+    }
+  });
+}
+
+// ============================
+// LEADERBOARD COMMAND
+// ============================
+if (content.startsWith("!rickroll-leaderboard")) {
+  const leaderboardPath = path.join(LOG_DIR, "rickroll_leaderboard.json");
+
+  function loadLeaderboard() {
+    ensureLogEnvironment();
+    try {
+      return JSON.parse(fs.readFileSync(leaderboardPath, "utf8"));
+    } catch {
+      return {};
+    }
+  }
+
+  const data = loadLeaderboard();
+  const entries = Object.entries(data);
+
+  if (entries.length === 0) {
+    return message.reply("No Rickroll quiz data yet.");
+  }
+
+  entries.sort((a, b) => b[1].passes - a[1].passes);
+
+  let text = "🏆 **Rickroll Quiz Leaderboard** 🏆\n\n";
+
+  for (let i = 0; i < entries.length; i++) {
+    const [userId, stats] = entries[i];
+    text += `**${i + 1}. <@${userId}>** — Passes: **${stats.passes}**, Fails: **${stats.fails}**\n`;
+  }
+
+  return message.channel.send(text);
+}
+
+  // ============================
+  // Execute command
+  // ============================
+  if (content.startsWith("!execute")) {
+    if (
+      !message.member.permissions.has(PermissionsBitField.Flags.Administrator) &&
+      !message.member.roles.cache.some(r => MOD_ROLE_NAMES.includes(r.name))
+    ) {
+      return message.reply("Only Admins and Moderators can use this command.");
+    }
+
+    const args = content.split(/\s+/).slice(1);
+    if (args.length === 0) return message.reply("Provide a user mention, ID, or name to execute.");
+
+    const rawInput = args[0].toLowerCase();
+    const idToken = args[0].replace(/[<@!>]/g, "");
+
+    const ownerMember = await message.guild.members.fetch(OWNER_IDS[0]).catch(() => null);
+
+    const ownerNames = new Set([
+      ...OWNER_IDS,
+      "topher",
+      "kingtopher",
+      ownerMember?.user?.username?.toLowerCase(),
+      ownerMember?.displayName?.toLowerCase()
+    ].filter(Boolean));
+
+    const isTargetingByName =
+      ownerNames.has(rawInput) ||
+      rawInput.includes("topher") ||
+      rawInput.includes("kingtopher");
+
+    let target = null;
+    try {
+      target = await message.guild.members.fetch(idToken);
+    } catch {}
+
+    const isTargetingOwner =
+      isTargetingByName ||
+      OWNER_IDS.includes(idToken) ||
+      (target && OWNER_IDS.includes(target.id));
+
+    if (isTargetingOwner) {
+      const offender = message.member;
+
+      let punishData = loadPunishData();
+      if (!punishData[offender.id]) punishData[offender.id] = 0;
+
+      punishData[offender.id] += 1;
+      const hours = punishData[offender.id];
+      const durationMs = hours * 60 * 60 * 1000;
+
+      savePunishData(punishData);
+
+      try {
+        await offender.timeout(durationMs, "Attempted to execute the bot owner");
+      } catch {
+        appendTextLog(
+          EXECUTION_LOG_FILE,
+          `Failed to timeout ${offender.user.tag} (${offender.id}) for attempting to execute owner.`
+        );
+        return message.reply("You attempted to execute the bot owner, but I couldn't mute you due to missing permissions.");
+      }
+
+      appendTextLog(
+        EXECUTION_LOG_FILE,
+        `User ${offender.user.tag} (${offender.id}) attempted to execute the owner and was timed out for ${hours} hour(s).`
+      );
+
+      return message.reply(
+        `You attempted to execute the bot owner.\n` +
+        `You have been muted for **${hours} hour(s)**.`
+      );
+    }
+
+    if (!target) {
+      return message.reply("Could not find that user in this server.");
+    }
+
+    const pollMessage = await message.channel.send(
+      `🗳️ **Execution Vote Started**\n` +
+      `Target: **${target.user.tag}** (${target.id})\n\n` +
+      `React with 👍 to mute for 1 week.\n` +
+      `React with 👎 to cancel.\n` +
+      `Voting ends in **30 seconds**.`
+    );
+
+    await pollMessage.react("👍");
+    await pollMessage.react("👎");
+
+    setTimeout(async () => {
+      let updated;
+      try {
+        updated = await pollMessage.fetch();
+      } catch {
+        return;
+      }
+
+      const yesVotes = (updated.reactions.cache.get("👍")?.count || 1) - 1;
+      const noVotes = (updated.reactions.cache.get("👎")?.count || 1) - 1;
+
+      const total = yesVotes + noVotes;
+      const yesPercent = total > 0 ? Math.round((yesVotes / total) * 100) : 0;
+      const noPercent = total > 0 ? Math.round((noVotes / total) * 100) : 0;
+
+      if (yesVotes > noVotes) {
+        const durationMs = 7 * 24 * 60 * 60 * 1000;
+
+        try {
+          await target.timeout(durationMs, "Execution vote passed");
+        } catch {
+          appendTextLog(
+            EXECUTION_LOG_FILE,
+            `Failed to mute ${target.user.tag} (${target.id}) after execution vote passed.`
+          );
+          return message.channel.send("❌ Failed to mute user. I may lack permissions.");
+        }
+
+        appendTextLog(
+          EXECUTION_LOG_FILE,
+          `Execution approved by vote on ${target.user.tag} (${target.id}). Yes: ${yesVotes} (${yesPercent}%), No: ${noVotes} (${noPercent}%). 1-week timeout applied.`
+        );
+
+        return message.channel.send(
+          `✅ **Execution Approved**\n` +
+          `👍 Yes: ${yesVotes} (${yesPercent}%)\n` +
+          `👎 No: ${noVotes} (${noPercent}%)\n\n` +
+          `🔇 **${target.user.tag} has been muted for 1 week.**`
+        );
+      }
+
+      appendTextLog(
+        EXECUTION_LOG_FILE,
+        `Execution cancelled by vote for ${target.user.tag} (${target.id}). Yes: ${yesVotes} (${yesPercent}%), No: ${noVotes} (${noPercent}%).`
+      );
+
+      return message.channel.send(
+        `❌ **Execution Cancelled**\n` +
+        `👍 Yes: ${yesVotes} (${yesPercent}%)\n` +
+        `👎 No: ${noVotes} (${noPercent}%)`
+      );
+    }, 30000);
+  }
+
+  // ============================
+  // Promote
+  // ============================
+  if (content.startsWith("!promote")) {
+    if (
+      !OWNER_IDS.includes(message.author.id) &&
+      !message.member.roles.cache.some(r => MOD_ROLE_NAMES.includes(r.name))
+    ) {
+      return message.reply("Only the bot owner or a Moderator can use this command.");
+    }
+
+    const args = content.split(/\s+/).slice(1);
+    if (args.length === 0) return message.reply("Provide a user ID or mention to promote.");
+
+    const idToken = args[0].replace(/[<@!>]/g, "");
+    let targetMember;
+    try {
+      targetMember = await message.guild.members.fetch(idToken);
+    } catch {
+      return message.reply("Could not find that user.");
+    }
+
+    const modRole = findModRole(message.guild);
+    if (!modRole) {
+      return message.reply(`No moderator role found. Valid names: ${MOD_ROLE_NAMES.join(", ")}`);
+    }
+
+    if (!canBotManageRole(message.guild, modRole)) {
+      return message.reply("I cannot manage the Moderator role.");
+    }
+
+    if (targetMember.roles.cache.has(modRole.id)) {
+      return message.reply(`${targetMember.user.tag} is already a Moderator.`);
+    }
+
+    await targetMember.roles.add(modRole);
+    appendTextLog(PROMOTION_LOG_FILE, `${message.author.tag} promoted ${targetMember.user.tag}.`);
+    return message.reply(`${targetMember.user.tag} has been promoted.`);
+  }
+
+  // ============================
+  // Demote
+  // ============================
+  if (content.startsWith("!demote")) {
+    if (
+      !OWNER_IDS.includes(message.author.id) &&
+      !message.member.roles.cache.some(r => MOD_ROLE_NAMES.includes(r.name))
+    ) {
+      return message.reply("Only the bot owner or a Moderator can use this command.");
+    }
+
+    const args = content.split(/\s+/).slice(1);
+    if (args.length === 0) return message.reply("Provide a user ID or mention to demote.");
+
+    const idToken = args[0].replace(/[<@!>]/g, "");
+    let targetMember;
+    try {
+      targetMember = await message.guild.members.fetch(idToken);
+    } catch {
+      return message.reply("Could not find that user.");
+    }
+
+    const modRole = findModRole(message.guild);
+    if (!modRole) {
+      return message.reply(`No moderator role found. Valid names: ${MOD_ROLE_NAMES.join(", ")}`);
+    }
+
+    if (!targetMember.roles.cache.has(modRole.id)) {
+      return message.reply(`${targetMember.user.tag} is not a Moderator.`);
+    }
+
+    await targetMember.roles.remove(modRole);
+    appendTextLog(DEMOTION_LOG_FILE, `${message.author.tag} demoted ${targetMember.user.tag}.`);
+    return message.reply(`${targetMember.user.tag} has been demoted.`);
+  }
+
+  // ============================
+  // Lockdown
+  // ============================
+  if (content.startsWith("!lockdown")) {
+    if (
+      !OWNER_IDS.includes(message.author.id) &&
+      !message.member.roles.cache.some(r => MOD_ROLE_NAMES.includes(r.name))
+    ) {
+      return message.reply("Only the bot owner or a Moderator can use this command.");
+    }
+
+    const args = content.split(/\s+/).slice(1);
+    if (args.length === 0) return message.reply("Mention channels to lock.");
+
+    let durationMs = 8 * 60 * 60 * 1000;
+    const last = args[args.length - 1];
+    const durMatch = last.match(/^(\d+)(h|m)$/i);
+    if (durMatch) {
+      const val = parseInt(durMatch[1], 10);
+      durationMs = durMatch[2].toLowerCase() === "h" ? val * 3600000 : val * 60000;
+      args.pop();
+    }
+
+    const channels = [];
+    const mentioned = message.mentions.channels;
+    if (mentioned.size > 0) {
+      for (const ch of mentioned.values()) channels.push(ch);
+    }
+
+    if (channels.length === 0) return message.reply("No valid channels found.");
+
+    if (LOCKUPS.has(message.guild.id)) {
+      return message.reply("A lockdown is already active.");
+    }
+
+    const originalOverwrites = [];
+    for (const ch of channels) {
+      const everyone = message.guild.roles.everyone;
+      const current = ch.permissionOverwrites.cache.get(everyone.id);
+      originalOverwrites.push({
+        channelId: ch.id,
+        overwrite: current ? { allow: current.allow.bitfield, deny: current.deny.bitfield } : null
+      });
+
+      await ch.permissionOverwrites.edit(everyone, {
+        SendMessages: false,
+        SendMessagesInThreads: false,
+        CreatePublicThreads: false,
+        CreatePrivateThreads: false
+      }).catch(() => {});
+    }
+
+    appendTextLog(
+      LOCKDOWN_LOG_FILE,
+      `${message.author.tag} (${message.author.id}) initiated lockdown on channels: ${channels.map(c => `${c.name} (${c.id})`).join(", ")} for ${durationMs / 3600000} hour(s).`
+    );
+
+    message.reply("Lockdown activated.");
+
+    const timeout = setTimeout(async () => {
+      for (const saved of originalOverwrites) {
+        const ch = message.guild.channels.cache.get(saved.channelId);
+        if (!ch) continue;
+        const everyone = message.guild.roles.everyone;
+
+        await ch.permissionOverwrites.edit(everyone, {
+          SendMessages: null,
+          SendMessagesInThreads: null,
+          CreatePublicThreads: null,
+          CreatePrivateThreads: null
+        }).catch(() => {});
+      }
+
+      appendTextLog(
+        LOCKDOWN_LOG_FILE,
+        `Lockdown expired automatically for guild ${message.guild.name} (${message.guild.id}).`
+      );
+
+      LOCKUPS.delete(message.guild.id);
+    }, durationMs);
+
+    LOCKUPS.set(message.guild.id, { timeout, originalOverwrites });
+  }
+
+  // ============================
+  // Unlock
+  // ============================
+  if (content.startsWith("!unlock")) {
+    if (!OWNER_IDS.includes(message.author.id))
+      return message.reply("Only the bot owner can use this command.");
+
+    const entry = LOCKUPS.get(message.guild.id);
+    if (!entry) return message.reply("No active lockdown.");
+
+    clearTimeout(entry.timeout);
+
+    for (const saved of entry.originalOverwrites) {
+      const ch = message.guild.channels.cache.get(saved.channelId);
+      if (!ch) continue;
+      const everyone = message.guild.roles.everyone;
+
+      await ch.permissionOverwrites.edit(everyone, {
+        SendMessages: null,
+        SendMessagesInThreads: null,
+        CreatePublicThreads: null,
+        CreatePrivateThreads: null
+      }).catch(() => {});
+    }
+
+    appendTextLog(
+      LOCKDOWN_LOG_FILE,
+      `${message.author.tag} (${message.author.id}) cancelled lockdown manually for guild ${message.guild.name} (${message.guild.id}).`
+    );
+
+    message.reply("Lockdown cancelled.");
+    LOCKUPS.delete(message.guild.id);
+  }
+
+  // ============================
+  // Forgive
+  // ============================
+  if (content.startsWith("!forgive")) {
+    if (
+      !OWNER_IDS.includes(message.author.id) &&
+      !message.member.roles.cache.some(r => MOD_ROLE_NAMES.includes(r.name))
+    ) {
+      return message.reply("Only the bot owner or a Moderator can use this command.");
+    }
+
+    const args = content.split(/\s+/).slice(1);
+    if (args.length === 0) return message.reply("Provide a user ID or mention to forgive.");
+
+    const idToken = args[0].replace(/[<@!>]/g, "");
+
+    let targetMember = null;
+    try {
+      targetMember = await message.guild.members.fetch(idToken);
+    } catch {}
+
+    const bans = await message.guild.bans.fetch().catch(() => null);
+    const bannedUser = bans?.get(idToken);
+
+    if (bannedUser) {
+      await message.guild.bans.remove(idToken, "Forgiveness override");
+      appendTextLog(EXECUTION_LOG_FILE, `${message.author.tag} forgave and unbanned ${bannedUser.user.tag}.`);
+      return message.reply(`Unbanned **${bannedUser.user.tag}**.`);
+    }
+
+    if (targetMember?.isCommunicationDisabled()) {
+      await targetMember.timeout(null, "Forgiveness override");
+      appendTextLog(EXECUTION_LOG_FILE, `${message.author.tag} forgave and unmuted ${targetMember.user.tag}.`);
+      return message.reply(`Unmuted **${targetMember.user.tag}**.`);
+    }
+
+    return message.reply("User is not muted or banned.");
+  }
+
+}); // end main handler
+
+// ============================
+// Apology-based forgiveness vote
+// ============================
+client.on("messageCreate", async (msg) => {
+  if (msg.author.bot) return;
+  if (!msg.guild) return;
+
+  const channelName = msg.channel.name.toLowerCase();
+  if (channelName !== "sinners plead" && channelName !== "apologies") return;
+
+  const guild = msg.guild;
+
+  let targetId = msg.author.id;
+
+  const mention = msg.mentions.users.first();
+  if (mention) {
+    targetId = mention.id;
+  } else {
+    const idMatch = msg.content.match(/(\d{16,20})/);
+    if (idMatch) targetId = idMatch[1];
+  }
+  const voteKey = `${guild.id}-${targetId}`;
+
+  // Prevent multiple active votes for same user
+  if (FORGIVENESS_VOTES.has(voteKey)) {
+    return msg.reply("There is already an active forgiveness vote for this user.");
+  }
+
+  // Check punishment state
+  let targetMember = null;
+  let isTimedOut = false;
+  let isBanned = false;
+
+  try {
+    targetMember = await guild.members.fetch(targetId);
+    isTimedOut = targetMember.isCommunicationDisabled();
+  } catch {
+    targetMember = null;
+  }
+
+  const bans = await guild.bans.fetch().catch(() => null);
+  const bannedUser = bans?.get(targetId);
+  if (bannedUser) isBanned = true;
+
+  if (!isTimedOut && !isBanned) {
+    return msg.reply("Forgiveness votes can only be started for users who are currently muted or banned.");
+  }
+
+  // Count human members for 50% threshold
+  const allMembers = await guild.members.fetch();
+  const humanMembers = allMembers.filter(m => !m.user.bot);
+  const humanCount = humanMembers.size || 1;
+  const requiredYes = Math.ceil(humanCount * 0.5);
+
+  const targetTag = isBanned
+    ? `${bannedUser.user.tag} (banned)`
+    : targetMember
+      ? `${targetMember.user.tag} (muted)`
+      : `User ID ${targetId}`;
+
+  const apologyText = msg.content.length > 500
+    ? msg.content.slice(0, 497) + "..."
+    : msg.content;
+
+  const headerMessage = await msg.channel.send(
+    `🙏 **Apology Submitted**\n` +
+    `From: <@${msg.author.id}>\n` +
+    `Target of forgiveness: **${targetTag}**\n\n` +
+    `> ${apologyText}\n\n` +
+    `🗳️ **Forgiveness Vote Started**\n` +
+    `- Duration: **1 hour**\n` +
+    `- Required: **${requiredYes} yes votes** (50% of all human members)\n` +
+    `React with 👍 to forgive, 👎 to deny.`
+  );
+
+  await headerMessage.react("👍");
+  await headerMessage.react("👎");
+
+  FORGIVENESS_VOTES.set(voteKey, {
+    messageId: headerMessage.id,
+    channelId: headerMessage.channel.id,
+    startedAt: Date.now()
+  });
+
+  // 1-hour timer
+  setTimeout(async () => {
+    const entry = FORGIVENESS_VOTES.get(voteKey);
+    if (!entry) return;
+
+    let voteMessage;
+    try {
+      const ch = guild.channels.cache.get(entry.channelId);
+      if (!ch || !ch.isTextBased()) throw new Error("Channel missing");
+      voteMessage = await ch.messages.fetch(entry.messageId);
+    } catch {
+      FORGIVENESS_VOTES.delete(voteKey);
+      return;
+    }
+
+    const yesVotes = (voteMessage.reactions.cache.get("👍")?.count || 1) - 1;
+    const noVotes = (voteMessage.reactions.cache.get("👎")?.count || 1) - 1;
+
+    // Recalculate human members at end
+    const allMembersEnd = await guild.members.fetch();
+    const humansEnd = allMembersEnd.filter(m => !m.user.bot);
+    const humanCountEnd = humansEnd.size || 1;
+    const requiredYesEnd = Math.ceil(humanCountEnd * 0.5);
+
+    const passed = yesVotes >= requiredYesEnd;
+
+    if (passed) {
+      let forgivenessActionTaken = false;
+
+      // Try unban first
+      const bansNow = await guild.bans.fetch().catch(() => null);
+      const bannedNow = bansNow?.get(targetId);
+
+      if (bannedNow) {
+        await guild.bans.remove(targetId, "Forgiveness vote passed");
+        forgivenessActionTaken = true;
+      } else {
+        // Try unmute
+        let memberNow = null;
+        try {
+          memberNow = await guild.members.fetch(targetId);
+        } catch {}
+
+        if (memberNow && memberNow.isCommunicationDisabled()) {
+          await memberNow.timeout(null, "Forgiveness vote passed");
+          forgivenessActionTaken = true;
+        }
+      }
+
+      appendTextLog(
+        EXECUTION_LOG_FILE,
+        `Forgiveness vote PASSED for user ID ${targetId}. Yes: ${yesVotes}, No: ${noVotes}, Required yes: ${requiredYesEnd}.`
+      );
+
+      await voteMessage.channel.send(
+        `✅ **Forgiveness Granted**\n` +
+        `👍 Yes: ${yesVotes} (required: ${requiredYesEnd})\n` +
+        `👎 No: ${noVotes}\n\n` +
+        (forgivenessActionTaken
+          ? `Punishment has been lifted for <@${targetId}>.`
+          : `Vote passed, but no active mute/ban was found for <@${targetId}>.`)
+      );
+    } else {
+      appendTextLog(
+        EXECUTION_LOG_FILE,
+        `Forgiveness vote FAILED for user ID ${targetId}. Yes: ${yesVotes}, No: ${noVotes}, Required yes: ${requiredYesEnd}.`
+      );
+
+      await voteMessage.channel.send(
+        `❌ **Forgiveness Denied**\n` +
+        `👍 Yes: ${yesVotes} (required: ${requiredYesEnd})\n` +
+        `👎 No: ${noVotes}\n\n` +
+        `Punishment remains in place for <@${targetId}>.`
+      );
+    }
+
+    FORGIVENESS_VOTES.delete(voteKey);
+  }, 60 * 60 * 1000); // 1 hour
+});
+
+
+// === Login ===
+const BOT_TOKEN = "BOT TOKEN HERE";
+
+client.login(BOT_TOKEN).catch(err => {
+  console.error("Failed to login. Check the token and try again.", err);
+});
+
